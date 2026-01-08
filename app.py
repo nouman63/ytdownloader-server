@@ -18,14 +18,33 @@ logger = logging.getLogger(__name__)
 TEMP_DIR = Path("/tmp/downloads")
 TEMP_DIR.mkdir(exist_ok=True)
 
+# Custom yt-dlp options to avoid 403 errors
+CUSTOM_YTDLP_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': False,
+    'verbose': False,
+    # Add headers to mimic a browser
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-us,en;q=0.5',
+        'Sec-Fetch-Mode': 'navigate',
+    },
+    # Add format selector
+    'format': 'best[height<=480]',
+    # Retry settings
+    'retries': 10,
+    'fragment_retries': 10,
+    'skip_unavailable_fragments': True,
+}
+
 def get_video_info(url):
     """Extract video information using yt-dlp"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-    }
-    
     try:
+        ydl_opts = CUSTOM_YTDLP_OPTS.copy()
+        ydl_opts['extract_flat'] = 'in_playlist'
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
@@ -45,36 +64,31 @@ def get_video_info(url):
             'error': str(e)
         }
 
-def download_video_simple(url, format_type='mp4'):
-    """Simple download function for Railway"""
+def download_video_alternative(url, format_type='mp4'):
+    """Alternative download method with better headers"""
     unique_id = str(uuid.uuid4())
+    output_template = f"/tmp/{unique_id}.%(ext)s"
     
-    # For Railway, use simpler options
+    # Different yt-dlp options for downloading
+    ydl_opts = CUSTOM_YTDLP_OPTS.copy()
+    ydl_opts['outtmpl'] = output_template
+    
     if format_type == 'mp3':
-        output_template = f"/tmp/{unique_id}.%(ext)s"
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': output_template,
-            'quiet': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-            }],
-        }
-    else:  # mp4
-        output_template = f"/tmp/{unique_id}.mp4"
-        ydl_opts = {
-            'format': 'best[height<=480]',  # Lower quality for Railway limits
-            'outtmpl': output_template,
-            'quiet': True,
-        }
+        ydl_opts['format'] = 'bestaudio/best'
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }]
+    else:
+        ydl_opts['format'] = 'best[height<=480]/best[height<=360]/worst'
+        ydl_opts['merge_output_format'] = 'mp4'
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             downloaded_file = ydl.prepare_filename(info)
             
-            # For mp3, ensure correct extension
             if format_type == 'mp3' and not downloaded_file.endswith('.mp3'):
                 downloaded_file = downloaded_file.rsplit('.', 1)[0] + '.mp3'
             
@@ -85,9 +99,44 @@ def download_video_simple(url, format_type='mp4'):
             }
     except Exception as e:
         logger.error(f"Error downloading video: {e}")
+        # Try one more time with simpler options
+        return download_video_simple_fallback(url, format_type)
+
+def download_video_simple_fallback(url, format_type='mp4'):
+    """Simplest possible download as fallback"""
+    unique_id = str(uuid.uuid4())
+    output_template = f"/tmp/{unique_id}.%(ext)s"
+    
+    ydl_opts = {
+        'outtmpl': output_template,
+        'quiet': True,
+        'format': 'worst' if format_type == 'mp4' else 'worstaudio/worst',
+    }
+    
+    if format_type == 'mp3':
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+        }]
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            downloaded_file = ydl.prepare_filename(info)
+            
+            if format_type == 'mp3' and not downloaded_file.endswith('.mp3'):
+                downloaded_file = downloaded_file.rsplit('.', 1)[0] + '.mp3'
+            
+            return {
+                'success': True,
+                'file_path': downloaded_file,
+                'title': clean_filename(info.get('title', 'download'))
+            }
+    except Exception as e:
+        logger.error(f"Fallback download also failed: {e}")
         return {
             'success': False,
-            'error': str(e)
+            'error': f"Download failed: {str(e)}. Railway IP may be blocked by YouTube."
         }
 
 def clean_filename(filename):
@@ -104,7 +153,8 @@ def index():
     return jsonify({
         'status': 'online',
         'service': 'YT Downloader Server',
-        'version': '1.1.0'
+        'version': '1.2.0',
+        'note': 'Using alternative download method for Railway'
     })
 
 @app.route('/api/health', methods=['GET'])
@@ -131,7 +181,7 @@ def video_info():
 
 @app.route('/api/download', methods=['GET'])
 def download():
-    """Download video/audio - SIMPLIFIED for Railway"""
+    """Download video/audio with fallback methods"""
     url = request.args.get('url')
     format_type = request.args.get('format', 'mp4')
     
@@ -150,8 +200,8 @@ def download():
     logger.info(f"Download request: {format_type} for {url}")
     
     try:
-        # Try to download
-        result = download_video_simple(url, format_type)
+        # First try alternative method
+        result = download_video_alternative(url, format_type)
         
         if not result['success']:
             return jsonify(result), 500
