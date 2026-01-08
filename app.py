@@ -5,9 +5,7 @@ import os
 import uuid
 import logging
 from pathlib import Path
-import threading
 import time
-import traceback
 
 app = Flask(__name__)
 CORS(app)
@@ -17,27 +15,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create temp directory
-TEMP_DIR = Path("temp_downloads")
+TEMP_DIR = Path("/tmp/downloads")
 TEMP_DIR.mkdir(exist_ok=True)
-
-def cleanup_old_files():
-    """Remove files older than 1 hour"""
-    while True:
-        try:
-            current_time = time.time()
-            for file_path in TEMP_DIR.glob("*"):
-                if file_path.is_file():
-                    file_age = current_time - file_path.stat().st_mtime
-                    if file_age > 3600:
-                        file_path.unlink()
-                        logger.info(f"Cleaned up: {file_path.name}")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-        time.sleep(300)
-
-# Start cleanup thread
-cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
-cleanup_thread.start()
 
 def get_video_info(url):
     """Extract video information using yt-dlp"""
@@ -66,31 +45,28 @@ def get_video_info(url):
             'error': str(e)
         }
 
-def download_video(url, format_type='mp4'):
-    """Download video/audio and return file path"""
+def download_video_simple(url, format_type='mp4'):
+    """Simple download function for Railway"""
     unique_id = str(uuid.uuid4())
     
+    # For Railway, use simpler options
     if format_type == 'mp3':
-        output_template = str(TEMP_DIR / f"{unique_id}.%(ext)s")
+        output_template = f"/tmp/{unique_id}.%(ext)s"
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': output_template,
             'quiet': True,
-            'no_warnings': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '192',
             }],
         }
     else:  # mp4
-        output_template = str(TEMP_DIR / f"{unique_id}.mp4")
+        output_template = f"/tmp/{unique_id}.mp4"
         ydl_opts = {
-            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+            'format': 'best[height<=480]',  # Lower quality for Railway limits
             'outtmpl': output_template,
             'quiet': True,
-            'no_warnings': True,
-            'merge_output_format': 'mp4',
         }
     
     try:
@@ -98,15 +74,9 @@ def download_video(url, format_type='mp4'):
             info = ydl.extract_info(url, download=True)
             downloaded_file = ydl.prepare_filename(info)
             
-            # For mp3, the file will already be .mp3 due to postprocessor
+            # For mp3, ensure correct extension
             if format_type == 'mp3' and not downloaded_file.endswith('.mp3'):
                 downloaded_file = downloaded_file.rsplit('.', 1)[0] + '.mp3'
-            elif format_type == 'mp4' and not downloaded_file.endswith('.mp4'):
-                downloaded_file = downloaded_file.rsplit('.', 1)[0] + '.mp4'
-            
-            # Verify file exists
-            if not os.path.exists(downloaded_file):
-                raise Exception(f"Downloaded file not found: {downloaded_file}")
             
             return {
                 'success': True,
@@ -115,7 +85,6 @@ def download_video(url, format_type='mp4'):
             }
     except Exception as e:
         logger.error(f"Error downloading video: {e}")
-        logger.error(traceback.format_exc())
         return {
             'success': False,
             'error': str(e)
@@ -123,13 +92,10 @@ def download_video(url, format_type='mp4'):
 
 def clean_filename(filename):
     """Clean filename for safe download"""
-    # Remove invalid characters
-    invalid_chars = '<>:"/\\|?*'
-    for char in invalid_chars:
-        filename = filename.replace(char, '')
-    # Limit length
-    if len(filename) > 100:
-        filename = filename[:100]
+    import re
+    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+    if len(filename) > 50:
+        filename = filename[:50]
     return filename.strip()
 
 @app.route('/')
@@ -138,12 +104,7 @@ def index():
     return jsonify({
         'status': 'online',
         'service': 'YT Downloader Server',
-        'version': '1.0.0',
-        'endpoints': {
-            'GET /api/info': 'Get video information',
-            'GET /api/download': 'Download video/audio',
-            'GET /api/health': 'Server health check'
-        }
+        'version': '1.1.0'
     })
 
 @app.route('/api/health', methods=['GET'])
@@ -170,7 +131,7 @@ def video_info():
 
 @app.route('/api/download', methods=['GET'])
 def download():
-    """Download video/audio"""
+    """Download video/audio - SIMPLIFIED for Railway"""
     url = request.args.get('url')
     format_type = request.args.get('format', 'mp4')
     
@@ -186,15 +147,16 @@ def download():
             'error': 'Format must be either mp4 or mp3'
         }), 400
     
-    logger.info(f"Downloading {format_type} for URL: {url}")
+    logger.info(f"Download request: {format_type} for {url}")
     
     try:
-        result = download_video(url, format_type)
+        # Try to download
+        result = download_video_simple(url, format_type)
         
         if not result['success']:
             return jsonify(result), 500
         
-        # Send the file
+        # Send file
         filename = f"{result['title']}.{format_type}"
         return send_file(
             result['file_path'],
@@ -204,11 +166,10 @@ def download():
         )
         
     except Exception as e:
-        logger.error(f"Error in download endpoint: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Download endpoint error: {e}")
         return jsonify({
             'success': False,
-            'error': f"Download failed: {str(e)}"
+            'error': f"Server error: {str(e)}"
         }), 500
 
 if __name__ == '__main__':
